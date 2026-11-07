@@ -30,7 +30,7 @@
   .primary { width:100%; background:var(--red); color:#fff; }
   .secondary { background:#fff; color:var(--red); border:1px solid var(--red); white-space:nowrap; }
   .ghost { background:none; color:var(--red); padding:8px 0; }
-  .head { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:14px; }
+  .head { display:flex; justify-content:space-between; align-items:baseline; gap:4px 12px; flex-wrap:wrap; margin-bottom:14px; }
   .count { color:var(--muted); font-size:14px; }
   .grid { display:grid; grid-template-columns: 1fr 1.4fr 40px; gap:8px; align-items:center; margin-bottom:8px; }
   .grid.labels { font-size:13px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; margin-bottom:6px; }
@@ -55,6 +55,16 @@
   .msg.ok { display:block; background:#e8f3ec; color:var(--green); }
   .msg.err { display:block; background:#fbeceb; color:var(--red); }
   .msg.info { display:block; background:#f3eee8; color:var(--ink); }
+  .lists-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; flex-wrap:wrap; }
+  .files { display:flex; flex-direction:column; gap:8px; }
+  .file { display:flex; justify-content:space-between; align-items:center; gap:12px; width:100%; text-align:left;
+          padding:12px 14px; background:#fff; border:1px solid var(--line); border-radius:10px; font-weight:500; color:var(--ink); }
+  .file:hover { border-color:var(--red); }
+  .file.selected { border-color:var(--red); background:#fff7f6; }
+  .file .when { color:var(--muted); font-size:13px; font-weight:400; white-space:nowrap; }
+  .empty { color:var(--muted); margin:0; }
+  .sheetlink { font-size:14px; color:var(--red); white-space:nowrap; }
+  .head h2 { overflow-wrap:anywhere; }
   @media (max-width:480px) {
     .linkrow { flex-direction:column; }
     .grid.labels { display:none; }
@@ -67,14 +77,20 @@
 <body>
 <main>
   <h1>🎅 Secret Santa</h1>
-  <p class="sub">Load your sheet, check the list, then draw. Nobody's match is ever shown here.</p>
+  <p class="sub">Pick or start a list, check who's in, then draw. Nobody's match is ever shown here.</p>
 
-  <!-- 1. Sheet link -->
+  <!-- 1. Sign in & pick a list -->
   <div class="card">
-    <label for="url">Google Sheets link</label>
-    <div class="linkrow">
-      <input id="url" type="url" placeholder="https://docs.google.com/spreadsheets/d/…">
-      <button id="load" class="secondary" type="button">Load participants</button>
+    <div id="signedOut">
+      <p class="empty" style="margin-bottom:16px">Sign in to see your Secret Santa lists, or start a new one.</p>
+      <button id="signin" class="primary" type="button">Sign in with Google</button>
+    </div>
+    <div id="signedIn" hidden>
+      <div class="lists-head">
+        <h2>Your Secret Santa lists</h2>
+        <button id="newList" class="secondary" type="button">+ New Secret Santa list</button>
+      </div>
+      <div id="files" class="files"></div>
     </div>
     <div id="loadMsg" class="msg"></div>
   </div>
@@ -83,9 +99,10 @@
     <!-- 2. Participants -->
     <div class="card">
       <div class="head">
-        <h2>Participants</h2>
-        <span id="count" class="count"></span>
+        <h2 id="sheetName">Participants</h2>
+        <a id="sheetLink" class="sheetlink" target="_blank" rel="noopener">Open in Google Sheets ↗</a>
       </div>
+      <p class="count" id="count" style="margin:-8px 0 12px"></p>
       <div class="grid labels"><span>Name</span><span>Email</span><span></span></div>
       <div id="list"></div>
       <div class="actions">
@@ -103,7 +120,7 @@
       <label for="note">Note for the email <span class="hint">(optional: budget, exchange date…)</span></label>
       <textarea id="note" placeholder="Budget is $30. Gift exchange on Dec 19!"></textarea>
 
-      <label class="check"><input id="redo" type="checkbox"> Redo the draw if this sheet already has one</label>
+      <label class="check"><input id="redo" type="checkbox"> Redo the draw if this list already has one</label>
 
       <button id="go" class="primary" type="button">Draw names &amp; send emails</button>
 
@@ -125,14 +142,23 @@
    It identifies this app to Google (it is not secret, and users never see it). */
 const CLIENT_ID = '634832757704-pj00nf0jto5c9db56g5nvvsop5v6fbii.apps.googleusercontent.com';
 
-const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/gmail.send';
+const SCOPES = [
+  'https://www.googleapis.com/auth/spreadsheets',     // read & write the lists
+  'https://www.googleapis.com/auth/drive.readonly',   // find the "Secret Santa" folder and the sheets in it
+  'https://www.googleapis.com/auth/drive.file',       // create the folder and new lists
+  'https://www.googleapis.com/auth/gmail.send'        // send the assignment emails
+].join(' ');
+const DRIVE = 'https://www.googleapis.com/drive/v3/files';
+const FOLDER_NAME = 'Secret Santa';
+const FOLDER_MIME = 'application/vnd.google-apps.folder';
+const SHEET_MIME = 'application/vnd.google-apps.spreadsheet';
 const SHEETS = 'https://sheets.googleapis.com/v4/spreadsheets/';
 const GMAIL_SEND = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const $ = id => document.getElementById(id);
 let token = null, tokenClient = null;
-let state = null; // { link, tab, d (as read from the sheet), rows: [{name, email, row|null}] }
+let state = null; // { link, tab, name, d (as read from the sheet), rows: [{name, email, row|null}] }
 
 /* ---------- UI helpers ---------- */
 function setState(name, s) {
@@ -153,7 +179,7 @@ function signIn() {
     tokenClient.callback = resp => {
       if (resp.error) return reject(new Error('Google sign-in failed: ' + (resp.error_description || resp.error)));
       if (!google.accounts.oauth2.hasGrantedAllScopes(resp, ...SCOPES.split(' '))) {
-        return reject(new Error('Please allow both Google Sheets and "Send email" access when signing in.'));
+        return reject(new Error('Please tick all the permission boxes (Drive, Sheets and "Send email") when signing in.'));
       }
       token = resp.access_token;
       setTimeout(() => { token = null; }, Math.max(60, (resp.expires_in || 3600) - 120) * 1000);
@@ -176,22 +202,16 @@ async function api(url, options) {
   if (res.ok) return res.status === 204 ? null : res.json();
   let detail = '';
   try { detail = (await res.json()).error.message; } catch (e) {}
-  if (res.status === 404) throw new Error("Couldn't find that spreadsheet. Check the link.");
+  if (res.status === 404) throw new Error("Couldn't find that file. It may have been deleted or moved.");
   if (res.status === 403 && /has not been used|is disabled/i.test(detail)) {
-    throw new Error('An API is turned off in your Google Cloud project. Enable both the Google Sheets API and the Gmail API, wait a minute, then try again.');
+    throw new Error('An API is turned off in your Google Cloud project. Enable the Google Drive API, Google Sheets API and Gmail API, wait a minute, then try again.');
   }
-  if (res.status === 403) throw new Error("Google refused access. Make sure your account can edit this sheet. (" + detail + ")");
+  if (res.status === 403) throw new Error("Google refused access. Make sure your account can edit this file. (" + detail + ")");
   if (res.status === 401) { token = null; throw new Error('Your Google sign-in expired. Click the button again.'); }
   throw new Error('Google returned an error: ' + (detail || res.status));
 }
 
 /* ---------- Sheet helpers ---------- */
-function parseLink(url) {
-  const m = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-  if (!m) throw new Error("That doesn't look like a Google Sheets link.");
-  const g = url.match(/[#&?]gid=(\d+)/);
-  return { id: m[1], gid: g ? Number(g[1]) : null };
-}
 const quote = title => "'" + title.replace(/'/g, "''") + "'";
 function colLetter(i) { let s = ''; i++; while (i > 0) { const r = (i - 1) % 26; s = String.fromCharCode(65 + r) + s; i = Math.floor((i - 1) / 26); } return s; }
 
@@ -437,8 +457,80 @@ $('add').addEventListener('click', () => {
   inputs[inputs.length - 1].focus();
 });
 
-// Changing the link means the loaded list no longer applies.
-$('url').addEventListener('input', () => { if (state) { state = null; $('editor').hidden = true; } });
+/* ---------- Drive: folder, list, create ---------- */
+const q = s => encodeURIComponent(s);
+
+async function findFolders() {
+  const res = await api(DRIVE + '?q=' + q("name = '" + FOLDER_NAME + "' and mimeType = '" + FOLDER_MIME + "' and trashed = false") +
+    '&fields=' + q('files(id)') + '&spaces=drive&pageSize=50');
+  return res.files.map(f => f.id);
+}
+
+async function listSheets() {
+  const folders = await findFolders();
+  if (!folders.length) return [];
+  const inAny = folders.map(id => "'" + id + "' in parents").join(' or ');
+  const res = await api(DRIVE + '?q=' + q('(' + inAny + ") and mimeType = '" + SHEET_MIME + "' and trashed = false") +
+    '&orderBy=' + q('modifiedTime desc') + '&fields=' + q('files(id,name,modifiedTime)') + '&spaces=drive&pageSize=200');
+  return res.files;
+}
+
+async function createList() {
+  let folderId = (await findFolders())[0];
+  if (!folderId) {
+    folderId = (await api(DRIVE + '?fields=id', { method: 'POST',
+      body: JSON.stringify({ name: FOLDER_NAME, mimeType: FOLDER_MIME }) })).id;
+  }
+  const now = new Date(), pad = n => String(n).padStart(2, '0');
+  const name = 'Secret Santa ' + now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate()) +
+               ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes());
+  const file = await api(DRIVE + '?fields=' + q('id,name'), { method: 'POST',
+    body: JSON.stringify({ name, mimeType: SHEET_MIME, parents: [folderId] }) });
+  // Label the columns.
+  const tab = await openTab({ id: file.id, gid: null });
+  await api(SHEETS + file.id + '/values/' + encodeURIComponent(quote(tab.title) + '!A1:B1') + '?valueInputOption=RAW',
+    { method: 'PUT', body: JSON.stringify({ values: [['Name', 'Email']] }) });
+  await api(SHEETS + file.id + ':batchUpdate', { method: 'POST', body: JSON.stringify({ requests: [
+    { repeatCell: { range: { sheetId: tab.sheetId, startRowIndex: 0, endRowIndex: 1 },
+                    cell: { userEnteredFormat: { textFormat: { bold: true } } }, fields: 'userEnteredFormat.textFormat.bold' } },
+    { updateSheetProperties: { properties: { sheetId: tab.sheetId, gridProperties: { frozenRowCount: 1 } }, fields: 'gridProperties.frozenRowCount' } }
+  ] }) });
+  return file;
+}
+
+function formatWhen(iso) {
+  const d = new Date(iso);
+  return 'Edited ' + d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+async function refreshFiles() {
+  const box = $('files');
+  box.textContent = '';
+  const files = await listSheets();
+  if (!files.length) {
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = 'No lists yet. Click "+ New Secret Santa list" to start one. ' +
+      'Spreadsheets you put in a Drive folder called "' + FOLDER_NAME + '" will show up here too.';
+    box.append(p);
+    return;
+  }
+  files.forEach(f => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'file' + (state && state.link.id === f.id ? ' selected' : '');
+    b.dataset.id = f.id;
+    const n = document.createElement('span'); n.textContent = f.name;
+    const w = document.createElement('span'); w.className = 'when'; w.textContent = formatWhen(f.modifiedTime);
+    b.append(n, w);
+    b.addEventListener('click', () => openList(f.id, f.name));
+    box.append(b);
+  });
+}
+
+function confirmDiscard() {
+  return !isDirty() || confirm('You have unsaved changes to the current list. Discard them?');
+}
 
 /* ---------- Load ---------- */
 function preflight() {
@@ -450,31 +542,74 @@ function preflight() {
   }
 }
 
-$('load').addEventListener('click', async () => {
-  const btn = $('load'), msg = $('loadMsg');
+async function openList(id, name, startBlank) {
+  if (!confirmDiscard()) return;
+  const msg = $('loadMsg');
   hide(msg);
+  setBusy(true);
   try {
-    preflight();
-    const url = $('url').value.trim();
-    if (!url) throw new Error('Paste your Google Sheets link first.');
-    const link = parseLink(url);
-    btn.disabled = true; btn.textContent = 'Loading…';
     await ensureSignedIn();
+    const link = { id, gid: null };
     const tab = await openTab(link);
     const d = await readSheet(link, tab);
-    state = { link, tab, d, rows: d.people.map(p => ({ name: p.name, email: p.email, row: p.row })) };
+    state = { link, tab, name, d, rows: d.people.map(p => ({ name: p.name, email: p.email, row: p.row })) };
+    if (startBlank && !state.rows.length) state.rows.push({ name: '', email: '', row: null });
+    $('sheetName').textContent = name;
+    $('sheetLink').href = 'https://docs.google.com/spreadsheets/d/' + id + '/edit';
     render();
+    document.querySelectorAll('.file').forEach(b => b.classList.toggle('selected', b.dataset.id === id));
     $('editor').hidden = false;
     hide($('saveMsg')); hide($('msg'));
     ['save', 'draw', 'send'].forEach(s => setState(s, null));
     $('sendLabel').textContent = 'Emailing everyone';
+    $('redo').checked = false;
     if (d.people.some(p => p.giftee)) {
-      show(msg, 'Heads up: this sheet already has a draw recorded. To draw again, tick "Redo the draw" below.', 'info');
+      show(msg, 'Heads up: this list already has a draw recorded. To draw again, tick "Redo the draw" below.', 'info');
     }
+    if (startBlank) document.querySelector('#list input').focus();
+    else $('editor').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (err) {
     show(msg, (err && err.message) || String(err), 'err');
   } finally {
-    btn.disabled = false; btn.textContent = 'Load participants';
+    setBusy(false);
+  }
+}
+
+$('signin').addEventListener('click', async () => {
+  const msg = $('loadMsg');
+  hide(msg);
+  try {
+    preflight();
+    $('signin').disabled = true;
+    await signIn();
+    $('signedOut').hidden = true;
+    $('signedIn').hidden = false;
+    await refreshFiles();
+  } catch (err) {
+    show(msg, (err && err.message) || String(err), 'err');
+  } finally {
+    $('signin').disabled = false;
+  }
+});
+
+$('newList').addEventListener('click', async () => {
+  if (!confirmDiscard()) return;
+  const msg = $('loadMsg'), btn = $('newList');
+  hide(msg);
+  setBusy(true);
+  btn.textContent = 'Creating…';
+  try {
+    await ensureSignedIn();
+    const file = await createList();
+    await refreshFiles();
+    state = null; // nothing to discard in a brand-new list
+    btn.textContent = '+ New Secret Santa list';
+    await openList(file.id, file.name, true);
+  } catch (err) {
+    show(msg, (err && err.message) || String(err), 'err');
+  } finally {
+    btn.textContent = '+ New Secret Santa list';
+    setBusy(false);
   }
 });
 
@@ -490,6 +625,7 @@ $('save').addEventListener('click', async () => {
     await ensureSignedIn();
     await saveToSheet();
     show(msg, 'Saved to the sheet.', 'ok');
+    refreshFiles().catch(() => {});
   } catch (err) {
     show(msg, (err && err.message) || String(err), 'err');
   } finally {
@@ -498,8 +634,8 @@ $('save').addEventListener('click', async () => {
 });
 
 function setBusy(b) {
-  ['load', 'save', 'go', 'add'].forEach(id => { $(id).disabled = b; });
-  document.querySelectorAll('#list input, #list button').forEach(el => { el.disabled = b; });
+  ['newList', 'save', 'go', 'add'].forEach(id => { $(id).disabled = b; });
+  document.querySelectorAll('#list input, #list button, .file').forEach(el => { el.disabled = b; });
 }
 
 /* ---------- Draw & send ---------- */
@@ -513,7 +649,7 @@ $('go').addEventListener('click', async () => {
   if (problems.length) { markProblems(problems); return show(msg, 'Fix the list first: ' + problems[0].text, 'err'); }
   if (state.rows.length < 3) return show(msg, 'You need at least 3 participants for a proper Secret Santa.', 'err');
   if (state.d.people.some(p => p.giftee) && !$('redo').checked) {
-    return show(msg, 'This sheet already has a draw recorded. Tick "Redo the draw" to replace it and re-send the emails.', 'err');
+    return show(msg, 'This list already has a draw recorded. Tick "Redo the draw" to replace it and re-send the emails.', 'err');
   }
 
   const note = $('note').value;
@@ -543,6 +679,7 @@ $('go').addEventListener('click', async () => {
     setState('send', 'done');
 
     state.d = await readSheet(link, tab); // keep the page in sync (giftees stay hidden)
+    refreshFiles().catch(() => {});
     show(msg, 'All done! ' + total + ' people have their Secret Santa email, and the matches are saved in the sheet. 🎄', 'ok');
   } catch (err) {
     setState(current, 'fail');
