@@ -37,7 +37,10 @@
   .remove { width:40px; height:40px; padding:0; background:none; color:var(--muted); font-size:22px; line-height:1; border-radius:8px; }
   .remove:hover { background:#f3eee8; color:var(--red); }
   .actions { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:8px; flex-wrap:wrap; }
-  .unsaved { font-size:14px; color:var(--muted); }
+  .statuswrap { display:flex; align-items:center; gap:10px; }
+  .status { font-size:14px; color:var(--muted); }
+  .status.ok { color:var(--green); }
+  .status.err { color:var(--red); }
   ol { list-style:none; padding:0; margin:24px 0 0; }
   li { display:flex; gap:12px; align-items:center; padding:10px 0; border-top:1px solid var(--line); color:var(--muted); }
   li .dot { width:22px; height:22px; border-radius:50%; border:2px solid var(--field); flex:none;
@@ -107,12 +110,11 @@
       <div id="list"></div>
       <div class="actions">
         <button id="add" class="ghost" type="button">+ Add person</button>
-        <span>
-          <span id="unsaved" class="unsaved" hidden>Unsaved changes</span>
-          <button id="save" class="secondary" type="button">Save to sheet</button>
+        <span class="statuswrap">
+          <span id="saveStatus" class="status" aria-live="polite">Changes save automatically</span>
+          <button id="retry" class="ghost" type="button" hidden>Retry</button>
         </span>
       </div>
-      <div id="saveMsg" class="msg"></div>
     </div>
 
     <!-- 3. Draw -->
@@ -120,7 +122,7 @@
       <label for="note">Note for the email <span class="hint">(optional: budget, exchange date…)</span></label>
       <textarea id="note" placeholder="Budget is $30. Gift exchange on Dec 19!"></textarea>
 
-      <label class="check"><input id="redo" type="checkbox"> Redo the draw if this list already has one</label>
+      <label class="check"><input id="redo" type="checkbox" checked> Redo the draw if this list already has one</label>
 
       <button id="go" class="primary" type="button">Draw names &amp; send emails</button>
 
@@ -258,9 +260,13 @@ async function readSheet(link, tab) {
 }
 
 /* Problems with a list of people, or [] if it's fine. Each problem: { index, field, text }. */
+const isBlank = r => !r.name.trim() && !r.email.trim();
+const filled = () => state.rows.filter(r => !isBlank(r));
+
 function validate(rows) {
   const problems = [], seen = {};
   rows.forEach((p, i) => {
+    if (isBlank(p)) return; // empty rows are ignored until something is typed in them
     const n = i + 1;
     if (!p.name.trim()) problems.push({ index: i, field: 'name', text: 'Person #' + n + ' needs a name.' });
     const email = p.email.trim();
@@ -277,7 +283,9 @@ function validate(rows) {
 
 /* Writes the edited list back: updates changed cells, deletes removed rows, adds new ones. */
 async function saveToSheet() {
-  const { link, tab, d, rows } = state;
+  const { link, tab, d } = state;
+  // Snapshot what we're saving, so typing during the save doesn't get mixed in.
+  const rows = filled().map(r => ({ ref: r, name: r.name.trim(), email: r.email.trim(), row: r.row }));
   const t = quote(tab.title);
   let offset = 0;
 
@@ -300,8 +308,8 @@ async function saveToSheet() {
   const updates = [];
   rows.filter(r => r.row).forEach(r => {
     const o = original[r.row];
-    if (o.name !== r.name.trim()) updates.push({ range: t + '!' + colLetter(d.nameCol) + (r.row + offset), values: [[r.name.trim()]] });
-    if (o.email !== r.email.trim()) updates.push({ range: t + '!' + colLetter(d.emailCol) + (r.row + offset), values: [[r.email.trim()]] });
+    if (o.name !== r.name) updates.push({ range: t + '!' + colLetter(d.nameCol) + (r.row + offset), values: [[r.name]] });
+    if (o.email !== r.email) updates.push({ range: t + '!' + colLetter(d.emailCol) + (r.row + offset), values: [[r.email]] });
   });
   if (updates.length) {
     await api(SHEETS + link.id + '/values:batchUpdate', { method: 'POST',
@@ -323,29 +331,95 @@ async function saveToSheet() {
     const start = d.rowCount + offset - removed.length + 1;
     const data = [];
     added.forEach((r, i) => {
-      data.push({ range: t + '!' + colLetter(d.nameCol) + (start + i), values: [[r.name.trim()]] });
-      data.push({ range: t + '!' + colLetter(d.emailCol) + (start + i), values: [[r.email.trim()]] });
+      data.push({ range: t + '!' + colLetter(d.nameCol) + (start + i), values: [[r.name]] });
+      data.push({ range: t + '!' + colLetter(d.emailCol) + (start + i), values: [[r.email]] });
     });
     await api(SHEETS + link.id + '/values:batchUpdate', { method: 'POST',
       body: JSON.stringify({ valueInputOption: 'RAW', data }) });
   }
 
-  // Re-read so the page matches the sheet exactly.
+  // Re-read, then point each on-screen row at its (possibly new) sheet row by email.
+  // The list on screen isn't redrawn, so the person typing keeps their place.
   state.d = await readSheet(link, tab);
-  state.rows = state.d.people.map(p => ({ name: p.name, email: p.email, row: p.row }));
-  render();
+  const byEmail = {};
+  state.d.people.forEach(p => { byEmail[p.email.toLowerCase()] = p.row; });
+  const saved = new Set(rows.map(r => r.ref));
+  state.rows.forEach(r => { if (!saved.has(r)) r.row = null; });
+  rows.forEach(r => { r.ref.row = byEmail[r.email.toLowerCase()] || null; });
+  updateMeta();
 }
 
 function isDirty() {
   if (!state) return false;
-  const { d, rows } = state;
+  const d = state.d, rows = filled();
   if (d.headerless && rows.length) return true;
-  if (rows.length !== d.people.length) return true;
-  return rows.some((r, i) => {
-    const o = d.people[i];
-    return !r.row || r.row !== o.row || r.name.trim() !== o.name || r.email.trim() !== o.email;
-  });
+  const orig = {}, used = new Set();
+  d.people.forEach(p => { orig[p.row] = p; });
+  for (const r of rows) {
+    const o = r.row && orig[r.row];
+    if (!o || used.has(r.row) || o.name !== r.name.trim() || o.email !== r.email.trim()) return true;
+    used.add(r.row);
+  }
+  return used.size !== d.people.length;
 }
+
+/* ---------- Autosave ---------- */
+let saveTimer = null, saving = null, saveAgain = false;
+
+function setStatus(kind, text) {
+  const el = $('saveStatus');
+  el.className = 'status' + (kind === 'saved' ? ' ok' : kind === 'error' || kind === 'invalid' ? ' err' : '');
+  el.textContent = kind === 'saved' ? '✓ All changes saved'
+    : kind === 'saving' ? 'Saving…'
+    : kind === 'invalid' ? 'Not saved yet: ' + text
+    : kind === 'error' ? "Couldn't save: " + text
+    : 'Changes save automatically';
+  $('retry').hidden = kind !== 'error';
+}
+
+function scheduleSave(delay) {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => autoSave(false), delay == null ? 800 : delay);
+}
+
+/* Saves if the list is valid and has changes. Never throws. fromUser = triggered by a click. */
+async function autoSave(fromUser) {
+  clearTimeout(saveTimer); saveTimer = null;
+  if (!state) return;
+  if (saving) { saveAgain = true; return saving; }
+  const problems = validate(state.rows);
+  if (problems.length) { setStatus('invalid', problems[0].text); return; }
+  if (!isDirty()) { if (state.d.people.length || filled().length) setStatus('saved'); return; }
+  if (!token && !fromUser) { setStatus('error', 'your Google sign-in expired. Click Retry to reconnect.'); return; }
+  setStatus('saving');
+  saving = (async () => {
+    try {
+      await ensureSignedIn();
+      await saveToSheet();
+      setStatus('saved');
+      refreshFiles().catch(() => {});
+    } catch (err) {
+      setStatus('error', (err && err.message) || String(err));
+    }
+  })();
+  await saving;
+  saving = null;
+  if (saveAgain) { saveAgain = false; await autoSave(false); }
+}
+
+/* Before leaving the current list: save what can be saved; ask before dropping the rest. */
+async function leaveCurrent() {
+  if (!state) return true;
+  clearTimeout(saveTimer);
+  if (saving) await saving;
+  if (isDirty()) await autoSave(true);
+  return !isDirty() || confirm("Some changes to the current list couldn't be saved (" +
+    $('saveStatus').textContent.replace(/^Not saved yet: |^Couldn't save: /, '') + '). Discard them?');
+}
+
+window.addEventListener('beforeunload', e => {
+  if (saving || saveTimer || isDirty()) { e.preventDefault(); e.returnValue = ''; }
+});
 
 function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = crypto.getRandomValues(new Uint32Array(1))[0] % (i + 1); [a[i], a[j]] = [a[j], a[i]]; } return a; }
 
@@ -421,12 +495,13 @@ function render() {
     const del = document.createElement('button');
     del.type = 'button'; del.className = 'remove'; del.textContent = '×';
     del.title = 'Remove'; del.setAttribute('aria-label', 'Remove person ' + (i + 1));
-    del.addEventListener('click', () => { state.rows.splice(i, 1); render(); });
+    del.addEventListener('click', () => { state.rows.splice(i, 1); render(); scheduleSave(300); });
 
     [name, email].forEach(inp => inp.addEventListener('input', () => {
       state.rows[i][inp.dataset.field] = inp.value;
       inp.classList.remove('bad');
       updateMeta();
+      scheduleSave();
     }));
     row.append(name, email, del);
     list.append(row);
@@ -435,9 +510,8 @@ function render() {
 }
 
 function updateMeta() {
-  const n = state.rows.length;
+  const n = filled().length;
   $('count').textContent = n + (n === 1 ? ' person' : ' people');
-  $('unsaved').hidden = !isDirty();
 }
 
 function markProblems(problems) {
@@ -513,7 +587,7 @@ async function refreshFiles() {
     p.textContent = 'No lists yet. Click "+ New Secret Santa list" to start one. ' +
       'Spreadsheets you put in a Drive folder called "' + FOLDER_NAME + '" will show up here too.';
     box.append(p);
-    return;
+    return files;
   }
   files.forEach(f => {
     const b = document.createElement('button');
@@ -526,11 +600,9 @@ async function refreshFiles() {
     b.addEventListener('click', () => openList(f.id, f.name));
     box.append(b);
   });
+  return files;
 }
 
-function confirmDiscard() {
-  return !isDirty() || confirm('You have unsaved changes to the current list. Discard them?');
-}
 
 /* ---------- Load ---------- */
 function preflight() {
@@ -543,7 +615,8 @@ function preflight() {
 }
 
 async function openList(id, name, startBlank) {
-  if (!confirmDiscard()) return;
+  if (state && state.link.id === id && !startBlank) return;
+  if (!(await leaveCurrent())) return;
   const msg = $('loadMsg');
   hide(msg);
   setBusy(true);
@@ -559,12 +632,13 @@ async function openList(id, name, startBlank) {
     render();
     document.querySelectorAll('.file').forEach(b => b.classList.toggle('selected', b.dataset.id === id));
     $('editor').hidden = false;
-    hide($('saveMsg')); hide($('msg'));
+    hide($('msg'));
+    setStatus('');
     ['save', 'draw', 'send'].forEach(s => setState(s, null));
     $('sendLabel').textContent = 'Emailing everyone';
-    $('redo').checked = false;
+    $('redo').checked = true;
     if (d.people.some(p => p.giftee)) {
-      show(msg, 'Heads up: this list already has a draw recorded. To draw again, tick "Redo the draw" below.', 'info');
+      show(msg, "Heads up: this list already has a draw recorded. Drawing again will replace it and re-send everyone's emails.", 'info');
     }
     if (startBlank) document.querySelector('#list input').focus();
     else $('editor').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -584,7 +658,8 @@ $('signin').addEventListener('click', async () => {
     await signIn();
     $('signedOut').hidden = true;
     $('signedIn').hidden = false;
-    await refreshFiles();
+    const files = await refreshFiles();
+    if (!files.length) await createAndOpen(); // first time: start a blank list straight away
   } catch (err) {
     show(msg, (err && err.message) || String(err), 'err');
   } finally {
@@ -592,8 +667,7 @@ $('signin').addEventListener('click', async () => {
   }
 });
 
-$('newList').addEventListener('click', async () => {
-  if (!confirmDiscard()) return;
+async function createAndOpen() {
   const msg = $('loadMsg'), btn = $('newList');
   hide(msg);
   setBusy(true);
@@ -602,7 +676,7 @@ $('newList').addEventListener('click', async () => {
     await ensureSignedIn();
     const file = await createList();
     await refreshFiles();
-    state = null; // nothing to discard in a brand-new list
+    state = null; // the previous list was already saved (or discarded) by leaveCurrent
     btn.textContent = '+ New Secret Santa list';
     await openList(file.id, file.name, true);
   } catch (err) {
@@ -611,43 +685,32 @@ $('newList').addEventListener('click', async () => {
     btn.textContent = '+ New Secret Santa list';
     setBusy(false);
   }
+}
+
+$('newList').addEventListener('click', async () => {
+  if (!(await leaveCurrent())) return;
+  await createAndOpen();
 });
 
-/* ---------- Save ---------- */
-$('save').addEventListener('click', async () => {
-  const msg = $('saveMsg');
-  hide(msg);
-  const problems = validate(state.rows);
-  if (problems.length) { markProblems(problems); return show(msg, problems[0].text, 'err'); }
-  if (!isDirty()) return show(msg, 'Nothing to save. The sheet already matches this list.', 'info');
-  setBusy(true);
-  try {
-    await ensureSignedIn();
-    await saveToSheet();
-    show(msg, 'Saved to the sheet.', 'ok');
-    refreshFiles().catch(() => {});
-  } catch (err) {
-    show(msg, (err && err.message) || String(err), 'err');
-  } finally {
-    setBusy(false);
-  }
-});
+$('retry').addEventListener('click', () => autoSave(true));
 
 function setBusy(b) {
-  ['newList', 'save', 'go', 'add'].forEach(id => { $(id).disabled = b; });
+  ['newList', 'go', 'add', 'retry'].forEach(id => { $(id).disabled = b; });
   document.querySelectorAll('#list input, #list button, .file').forEach(el => { el.disabled = b; });
 }
 
 /* ---------- Draw & send ---------- */
 $('go').addEventListener('click', async () => {
   const msg = $('msg');
-  hide(msg); hide($('saveMsg'));
+  hide(msg);
   ['save', 'draw', 'send'].forEach(s => setState(s, null));
   $('sendLabel').textContent = 'Emailing everyone';
+  clearTimeout(saveTimer); saveTimer = null;
+  if (saving) await saving;
 
   const problems = validate(state.rows);
   if (problems.length) { markProblems(problems); return show(msg, 'Fix the list first: ' + problems[0].text, 'err'); }
-  if (state.rows.length < 3) return show(msg, 'You need at least 3 participants for a proper Secret Santa.', 'err');
+  if (filled().length < 3) return show(msg, 'You need at least 3 participants for a proper Secret Santa.', 'err');
   if (state.d.people.some(p => p.giftee) && !$('redo').checked) {
     return show(msg, 'This list already has a draw recorded. Tick "Redo the draw" to replace it and re-send the emails.', 'err');
   }
@@ -660,6 +723,7 @@ $('go').addEventListener('click', async () => {
 
     setState('save', 'active');
     await saveToSheet(); // also re-reads, so the draw uses exactly what's in the sheet
+    setStatus('saved');
     setState('save', 'done');
 
     current = 'draw';
@@ -686,7 +750,6 @@ $('go').addEventListener('click', async () => {
     show(msg, (err && err.message) || String(err), 'err');
   } finally {
     setBusy(false);
-    $('redo').checked = false;
     updateMeta();
   }
 });
